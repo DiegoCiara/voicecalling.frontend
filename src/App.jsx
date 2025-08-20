@@ -54,7 +54,7 @@ export default function App() {
         localStreamRef.current.getTracks().forEach(track => track.stop());
       }
 
-      localStreamRef.current = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: {
           width: { ideal: 1280 },
@@ -63,28 +63,16 @@ export default function App() {
         },
       });
 
+      localStreamRef.current = stream;
+
       if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current;
+        localVideoRef.current.srcObject = stream;
       }
 
-      // Re-add tracks to existing peers
-      Object.values(pcsRef.current).forEach(pc => {
-        if (pc.connectionState === 'connected') {
-          const senders = pc.getSenders();
-          senders.forEach(sender => {
-            if (sender.track) {
-              const newTrack = localStreamRef.current.getTracks()
-                .find(t => t.kind === sender.track.kind);
-              if (newTrack) {
-                sender.replaceTrack(newTrack);
-              }
-            }
-          });
-        }
-      });
-
+      return stream; // ✅ Retorna a stream
     } catch (error) {
       console.error("Erro ao acessar mídia local:", error);
+      throw error;
     }
   }
 
@@ -100,22 +88,21 @@ export default function App() {
         }
       });
     }
-
-    // Receber tracks remotas
     pc.ontrack = (event) => {
-      const [remoteStream] = event.streams;
+      if (event.streams && event.streams.length > 0) {
+        const remoteStream = event.streams[0];
 
-      // Atualizar estado com informações do stream remoto
-      setPeers(prev => ({
-        ...prev,
-        [remoteSocketId]: {
-          ...prev[remoteSocketId],
-          connected: true,
-          hasVideo: remoteStream.getVideoTracks().length > 0,
-          hasAudio: remoteStream.getAudioTracks().length > 0,
-          stream: remoteStream // CORREÇÃO: Armazenar o stream
-        }
-      }));
+        setPeers(prev => ({
+          ...prev,
+          [remoteSocketId]: {
+            ...prev[remoteSocketId],
+            connected: true,
+            hasVideo: remoteStream.getVideoTracks().length > 0,
+            hasAudio: remoteStream.getAudioTracks().length > 0,
+            stream: remoteStream
+          }
+        }));
+      }
     };
 
     // Enviar candidatos ICE
@@ -216,6 +203,9 @@ export default function App() {
         // Conectar com cada peer existente
         for (const peerId of peerIds) {
           if (!pcsRef.current[peerId]) {
+            if (!localStreamRef.current) {
+              await startLocalMedia();
+            }
             const pc = createPeerConnection(peerId);
             try {
               const offer = await pc.createOffer({
