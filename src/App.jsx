@@ -510,7 +510,6 @@ export default function App() {
         padding: 16,
         borderRadius: "8px",
         border: "1px solid #ddd",
-        backgroundColor: "#f9f9f9"
       }}>
         <h4>Status:</h4>
         <p>✅ {connected ? "Conectado" : "Desconectado"}</p>
