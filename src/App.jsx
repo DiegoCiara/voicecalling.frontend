@@ -7,6 +7,8 @@ const SIGNAL_SERVER_URL = "https://calls.softsales.com.br/";
 const RTC_CONFIG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" }
   ],
 };
 
@@ -15,18 +17,23 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [peers, setPeers] = useState({});
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [camOff, setCamOff] = useState(false);
+
   const socketRef = useRef(null);
   const pcsRef = useRef({});
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const localVideoRef = useRef(null);
-  const remoteVideosContainerRef = useRef(null);
-
-  const [muted, setMuted] = useState(false);
-  const [camOff, setCamOff] = useState(false);
 
   useEffect(() => {
-    socketRef.current = io(SIGNAL_SERVER_URL, { transports: ["websocket"] });
+    socketRef.current = io(SIGNAL_SERVER_URL, {
+      transports: ["websocket"],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000
+    });
+
     createNewRoom();
 
     return () => {
@@ -34,32 +41,6 @@ export default function App() {
       cleanupAll();
     };
   }, []);
-
-  // Função para criar elemento de vídeo remoto
-  const createRemoteVideoElement = (socketId) => {
-    const videoElement = document.createElement('video');
-    videoElement.id = `remote-video-${socketId}`;
-    videoElement.playsInline = true;
-    videoElement.autoplay = true;
-    videoElement.style.cssText = `
-      width: 100%;
-      height: 240px;
-      background: #000;
-      border-radius: 8px;
-      border: 2px solid #ddd;
-      margin-bottom: 16px;
-    `;
-
-    return videoElement;
-  };
-
-  // Função para remover elemento de vídeo remoto
-  const removeRemoteVideoElement = (socketId) => {
-    const videoElement = document.getElementById(`remote-video-${socketId}`);
-    if (videoElement) {
-      videoElement.remove();
-    }
-  };
 
   function createNewRoom() {
     const newRoomId = uuidv4();
@@ -75,12 +56,33 @@ export default function App() {
 
       localStreamRef.current = await navigator.mediaDevices.getUserMedia({
         audio: true,
-        video: { width: 1280, height: 720 },
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+        },
       });
 
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = localStreamRef.current;
       }
+
+      // Re-add tracks to existing peers
+      Object.values(pcsRef.current).forEach(pc => {
+        if (pc.connectionState === 'connected') {
+          const senders = pc.getSenders();
+          senders.forEach(sender => {
+            if (sender.track) {
+              const newTrack = localStreamRef.current.getTracks()
+                .find(t => t.kind === sender.track.kind);
+              if (newTrack) {
+                sender.replaceTrack(newTrack);
+              }
+            }
+          });
+        }
+      });
+
     } catch (error) {
       console.error("Erro ao acessar mídia local:", error);
     }
@@ -89,10 +91,13 @@ export default function App() {
   function createPeerConnection(remoteSocketId) {
     const pc = new RTCPeerConnection(RTC_CONFIG);
 
-    // Adicionar tracks locais
+    // CORREÇÃO: Adicionar tracks locais apenas se existirem
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
+        // Verificar se o track ainda está ativo
+        if (track.readyState === 'live') {
+          pc.addTrack(track, localStreamRef.current);
+        }
       });
     }
 
@@ -100,23 +105,15 @@ export default function App() {
     pc.ontrack = (event) => {
       const [remoteStream] = event.streams;
 
-      // Criar elemento de vídeo para este peer
-      const videoElement = createRemoteVideoElement(remoteSocketId);
-      videoElement.srcObject = remoteStream;
-
-      // Adicionar ao container
-      if (remoteVideosContainerRef.current) {
-        remoteVideosContainerRef.current.appendChild(videoElement);
-      }
-
-      // Atualizar estado do peer para conectado
+      // Atualizar estado com informações do stream remoto
       setPeers(prev => ({
         ...prev,
         [remoteSocketId]: {
           ...prev[remoteSocketId],
           connected: true,
           hasVideo: remoteStream.getVideoTracks().length > 0,
-          hasAudio: remoteStream.getAudioTracks().length > 0
+          hasAudio: remoteStream.getAudioTracks().length > 0,
+          stream: remoteStream // CORREÇÃO: Armazenar o stream
         }
       }));
     };
@@ -143,9 +140,12 @@ export default function App() {
           }
         }));
       } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        // Remover peer se desconectado
         cleanupPeer(remoteSocketId);
       }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`ICE ${remoteSocketId} state:`, pc.iceConnectionState);
     };
 
     pcsRef.current[remoteSocketId] = pc;
@@ -158,20 +158,28 @@ export default function App() {
       pc = createPeerConnection(from);
     }
 
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
 
-    socketRef.current.emit("signal", {
-      to: from,
-      data: answer
-    });
+      socketRef.current.emit("signal", {
+        to: from,
+        data: answer
+      });
+    } catch (error) {
+      console.error("Erro ao processar offer:", error);
+    }
   }
 
   async function handleAnswer(from, answer) {
     const pc = pcsRef.current[from];
     if (pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (error) {
+        console.error("Erro ao processar answer:", error);
+      }
     }
   }
 
@@ -179,7 +187,7 @@ export default function App() {
     const pc = pcsRef.current[from];
     if (pc) {
       try {
-        await pc.addIceCandidate(candidate);
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (err) {
         console.error("Erro ao adicionar ICE:", err);
       }
@@ -187,79 +195,109 @@ export default function App() {
   }
 
   async function joinRoom() {
-    await startLocalMedia();
+    try {
+      await startLocalMedia();
 
-    socketRef.current.on("joined", async ({ peers: peerIds }) => {
-      setConnected(true);
-      console.log("Peers na sala:", peerIds);
+      socketRef.current.on("joined", async ({ peers: peerIds }) => {
+        setConnected(true);
+        console.log("Peers na sala:", peerIds);
 
-      // Inicializar estado para cada peer existente
-      const initialPeers = {};
-      peerIds.forEach(peerId => {
-        initialPeers[peerId] = { connected: false, hasVideo: false, hasAudio: false };
-      });
-      setPeers(initialPeers);
-
-      // Conectar com cada peer existente
-      for (const peerId of peerIds) {
-        if (!pcsRef.current[peerId]) {
-          const pc = createPeerConnection(peerId);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-
-          socketRef.current.emit("signal", {
-            to: peerId,
-            data: offer
-          });
-        }
-      }
-    });
-
-    socketRef.current.on("peer-joined", async ({ socketId }) => {
-      console.log("Novo peer entrou:", socketId);
-
-      // Adicionar novo peer ao estado
-      setPeers(prev => ({
-        ...prev,
-        [socketId]: { connected: false, hasVideo: false, hasAudio: false }
-      }));
-
-      // Iniciar conexão com o novo peer
-      if (!pcsRef.current[socketId]) {
-        const pc = createPeerConnection(socketId);
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        socketRef.current.emit("signal", {
-          to: socketId,
-          data: offer
+        const initialPeers = {};
+        peerIds.forEach(peerId => {
+          initialPeers[peerId] = {
+            connected: false,
+            hasVideo: false,
+            hasAudio: false,
+            stream: null
+          };
         });
-      }
-    });
+        setPeers(initialPeers);
 
-    socketRef.current.on("signal", async ({ from, data }) => {
-      switch (data.type) {
-        case "offer":
-          await handleOffer(from, data);
-          break;
-        case "answer":
-          await handleAnswer(from, data);
-          break;
-        case "ice-candidate":
-          await handleIceCandidate(from, data.candidate);
-          break;
-      }
-    });
+        // Conectar com cada peer existente
+        for (const peerId of peerIds) {
+          if (!pcsRef.current[peerId]) {
+            const pc = createPeerConnection(peerId);
+            try {
+              const offer = await pc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+              });
+              await pc.setLocalDescription(offer);
 
-    socketRef.current.on("peer-left", ({ socketId }) => {
-      cleanupPeer(socketId);
-    });
+              socketRef.current.emit("signal", {
+                to: peerId,
+                data: offer
+              });
+            } catch (error) {
+              console.error("Erro ao criar offer:", error);
+            }
+          }
+        }
+      });
 
-    socketRef.current.on("room-created", ({ roomId: newRoomId }) => {
-      setRoomId(newRoomId);
-    });
+      socketRef.current.on("peer-joined", async ({ socketId }) => {
+        console.log("Novo peer entrou:", socketId);
 
-    socketRef.current.emit("join", { roomId });
+        setPeers(prev => ({
+          ...prev,
+          [socketId]: {
+            connected: false,
+            hasVideo: false,
+            hasAudio: false,
+            stream: null
+          }
+        }));
+
+        if (!pcsRef.current[socketId]) {
+          const pc = createPeerConnection(socketId);
+          try {
+            const offer = await pc.createOffer({
+              offerToReceiveAudio: true,
+              offerToReceiveVideo: true
+            });
+            await pc.setLocalDescription(offer);
+
+            socketRef.current.emit("signal", {
+              to: socketId,
+              data: offer
+            });
+          } catch (error) {
+            console.error("Erro ao criar offer para novo peer:", error);
+          }
+        }
+      });
+
+      socketRef.current.on("signal", async ({ from, data }) => {
+        try {
+          switch (data.type) {
+            case "offer":
+              await handleOffer(from, data);
+              break;
+            case "answer":
+              await handleAnswer(from, data);
+              break;
+            case "ice-candidate":
+              await handleIceCandidate(from, data.candidate);
+              break;
+          }
+        } catch (error) {
+          console.error("Erro ao processar signal:", error);
+        }
+      });
+
+      socketRef.current.on("peer-left", ({ socketId }) => {
+        cleanupPeer(socketId);
+      });
+
+      socketRef.current.on("room-created", ({ roomId: newRoomId }) => {
+        setRoomId(newRoomId);
+      });
+
+      socketRef.current.emit("join", { roomId });
+
+    } catch (error) {
+      console.error("Erro ao entrar na sala:", error);
+    }
   }
 
   function cleanupPeer(socketId) {
@@ -268,10 +306,6 @@ export default function App() {
       delete pcsRef.current[socketId];
     }
 
-    // Remover elemento de vídeo
-    removeRemoteVideoElement(socketId);
-
-    // Remover do estado
     setPeers(prev => {
       const newPeers = { ...prev };
       delete newPeers[socketId];
@@ -292,12 +326,8 @@ export default function App() {
       screenStreamRef.current = null;
     }
 
-    // Limpar todos os elementos de vídeo remotos
-    if (remoteVideosContainerRef.current) {
-      remoteVideosContainerRef.current.innerHTML = '';
-    }
+    setPeers({});
   }
-
 
   function leaveRoom() {
     socketRef.current.emit("leave");
@@ -307,15 +337,19 @@ export default function App() {
   }
 
   function toggleMute() {
-    const tracks = localStreamRef.current?.getAudioTracks?.() || [];
-    tracks.forEach((t) => (t.enabled = !t.enabled));
-    setMuted((m) => !m);
+    if (localStreamRef.current) {
+      const tracks = localStreamRef.current.getAudioTracks();
+      tracks.forEach((t) => (t.enabled = !t.enabled));
+      setMuted((m) => !m);
+    }
   }
 
   function toggleCam() {
-    const tracks = localStreamRef.current?.getVideoTracks?.() || [];
-    tracks.forEach((t) => (t.enabled = !t.enabled));
-    setCamOff((c) => !c);
+    if (localStreamRef.current) {
+      const tracks = localStreamRef.current.getVideoTracks();
+      tracks.forEach((t) => (t.enabled = !t.enabled));
+      setCamOff((c) => !c);
+    }
   }
 
   async function shareScreen() {
@@ -328,16 +362,21 @@ export default function App() {
         }
 
         // Voltar para a câmera
-        const videoTrack = localStreamRef.current.getVideoTracks()[0];
+        if (localStreamRef.current) {
+          const videoTrack = localStreamRef.current.getVideoTracks()[0];
 
-        // Atualizar todos os peers
-        Object.values(pcsRef.current).forEach(pc => {
-          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-          if (sender) sender.replaceTrack(videoTrack);
-        });
+          Object.values(pcsRef.current).forEach(pc => {
+            if (pc.connectionState === 'connected') {
+              const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+              if (sender && videoTrack) {
+                sender.replaceTrack(videoTrack);
+              }
+            }
+          });
 
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current;
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = localStreamRef.current;
+          }
         }
 
         setIsScreenSharing(false);
@@ -346,7 +385,10 @@ export default function App() {
 
       // Iniciar compartilhamento
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
+        video: {
+          cursor: "always",
+          displaySurface: "window"
+        },
         audio: true
       });
 
@@ -359,28 +401,38 @@ export default function App() {
 
       const videoTrack = screenStream.getVideoTracks()[0];
 
-      // Atualizar todos os peers
+      // Atualizar todos os peers conectados
       Object.values(pcsRef.current).forEach(pc => {
-        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-        if (sender) sender.replaceTrack(videoTrack);
+        if (pc.connectionState === 'connected') {
+          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+          if (sender && videoTrack) {
+            sender.replaceTrack(videoTrack);
+          }
+        }
       });
 
       setIsScreenSharing(true);
 
       // Quando parar o compartilhamento
       videoTrack.onended = async () => {
-        const camTrack = localStreamRef.current.getVideoTracks()[0];
+        if (localStreamRef.current) {
+          const camTrack = localStreamRef.current.getVideoTracks()[0];
 
-        Object.values(pcsRef.current).forEach(pc => {
-          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-          if (sender) sender.replaceTrack(camTrack);
-        });
+          Object.values(pcsRef.current).forEach(pc => {
+            if (pc.connectionState === 'connected') {
+              const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+              if (sender && camTrack) {
+                sender.replaceTrack(camTrack);
+              }
+            }
+          });
 
-        setIsScreenSharing(false);
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current;
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = localStreamRef.current;
+          }
         }
 
+        setIsScreenSharing(false);
         if (screenStreamRef.current) {
           screenStreamRef.current.getTracks().forEach(track => track.stop());
           screenStreamRef.current = null;
@@ -391,6 +443,58 @@ export default function App() {
       console.error("Erro ao compartilhar tela:", error);
     }
   }
+
+  // Componente para vídeos remotos
+  const RemoteVideo = ({ peerId, peerInfo }) => {
+    const videoRef = useRef(null);
+
+    useEffect(() => {
+      if (videoRef.current && peerInfo.stream) {
+        videoRef.current.srcObject = peerInfo.stream;
+      }
+    }, [peerInfo.stream]);
+
+    if (!peerInfo.connected) {
+      return (
+        <div style={{
+          width: "100%",
+          height: "240px",
+          // background: "#f0f0f0",
+          borderRadius: "8px",
+          border: "2px dashed #ddd",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "#666"
+        }}>
+          Conectando...
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <video
+          ref={videoRef}
+          playsInline
+          autoPlay
+          style={{
+            width: "100%",
+            height: "240px",
+            background: "#000",
+            borderRadius: "8px",
+            border: "2px solid #ddd",
+            marginBottom: "8px"
+          }}
+        />
+        <div style={{ fontSize: "12px", color: "#666" }}>
+          ID: {peerId.substring(0, 8)}...
+          {peerInfo.hasVideo && " 🎥"}
+          {peerInfo.hasAudio && " 🔊"}
+        </div>
+      </div>
+    );
+  };
 
   const participantCount = Object.keys(peers).length;
   const connectedParticipants = Object.values(peers).filter(p => p.connected).length;
@@ -455,7 +559,7 @@ export default function App() {
         </button>
       </div>
 
-      <div style={{ marginBottom: '16px', padding: '12px',borderRadius: '8px' }}>
+      <div style={{ marginBottom: '16px', padding: '12px', borderRadius: '8px' }}>
         <strong>Compartilhe este ID para outros participarem: </strong>
         <code>{roomId}</code>
         <button
@@ -465,7 +569,8 @@ export default function App() {
           Copiar
         </button>
       </div>
-<div style={{
+
+      <div style={{
         display: "grid",
         gridTemplateColumns: "1fr 1fr",
         gap: 16,
@@ -490,18 +595,15 @@ export default function App() {
 
         <div>
           <h3>Participantes Remotos ({connectedParticipants} conectados)</h3>
-          <div
-            ref={remoteVideosContainerRef}
-            style={{
-              display: "grid",
-              gap: "16px"
-            }}
-          >
-            {participantCount === 0 && (
+          <div style={{
+            display: "grid",
+            gap: "16px"
+          }}>
+            {participantCount === 0 ? (
               <div style={{
                 width: "100%",
                 height: "240px",
-                background: "#f0f0f0",
+                // background: "#f0f0f0",
                 borderRadius: "8px",
                 border: "2px dashed #ddd",
                 display: "flex",
@@ -511,6 +613,10 @@ export default function App() {
               }}>
                 Aguardando participantes...
               </div>
+            ) : (
+              Object.entries(peers).map(([peerId, peerInfo]) => (
+                <RemoteVideo key={peerId} peerId={peerId} peerInfo={peerInfo} />
+              ))
             )}
           </div>
         </div>
@@ -528,7 +634,6 @@ export default function App() {
         <p>🔊 {muted ? "Microfone mudo" : "Microfone ativo"}</p>
         <p>🖥️ {isScreenSharing ? "Compartilhando tela" : "Tela não compartilhada"}</p>
 
-        {/* Lista detalhada de participantes */}
         {participantCount > 0 && (
           <div style={{ marginTop: '16px' }}>
             <h5>Detalhes dos Participantes:</h5>
@@ -536,7 +641,7 @@ export default function App() {
               <div key={socketId} style={{
                 padding: '8px',
                 margin: '4px 0',
-                background: peerInfo.connected ? '#005e002f' : '#433c2721',
+                // background: peerInfo.connected ? '#e8f5e8' : '#fff3cd',
                 borderRadius: '4px',
                 border: '1px solid #ddd'
               }}>
