@@ -151,29 +151,89 @@ export default function App() {
     pcsRef.current[remoteSocketId] = pc;
     return pc;
   }
-
-  async function handleOffer(from, offer) {
-    let pc = pcsRef.current[from];
-    if (!pc) {
-      pc = createPeerConnection(from);
-    }
-
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    socketRef.current.emit("signal", {
-      to: from,
-      data: answer
-    });
+async function handleOffer(from, offer) {
+  let pc = pcsRef.current[from];
+  if (!pc) {
+    pc = createPeerConnection(from);
   }
 
-  async function handleAnswer(from, answer) {
-    const pc = pcsRef.current[from];
-    if (pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    }
+  await pc.setRemoteDescription(new RTCSessionDescription(offer));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  socketRef.current.emit("signal", {
+    to: from,
+    data: {
+      type: "answer",
+      sdp: answer.sdp,
+    },
+  });
+}
+
+async function handleAnswer(from, answer) {
+  const pc = pcsRef.current[from];
+  if (pc) {
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
   }
+}
+
+async function joinRoom() {
+  await startLocalMedia();
+
+  socketRef.current.on("joined", async ({ peers: peerIds }) => {
+    setConnected(true);
+    // ...existing code...
+
+    for (const peerId of peerIds) {
+      if (!pcsRef.current[peerId]) {
+        const pc = createPeerConnection(peerId);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        socketRef.current.emit("signal", {
+          to: peerId,
+          data: {
+            type: "offer",
+            sdp: offer.sdp,
+          },
+        });
+      }
+    }
+  });
+
+  socketRef.current.on("peer-joined", async ({ socketId }) => {
+    // ...existing code...
+    if (!pcsRef.current[socketId]) {
+      const pc = createPeerConnection(socketId);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      socketRef.current.emit("signal", {
+        to: socketId,
+        data: {
+          type: "offer",
+          sdp: offer.sdp,
+        },
+      });
+    }
+  });
+
+  socketRef.current.on("signal", async ({ from, data }) => {
+    switch (data.type) {
+      case "offer":
+        await handleOffer(from, { type: "offer", sdp: data.sdp });
+        break;
+      case "answer":
+        await handleAnswer(from, { type: "answer", sdp: data.sdp });
+        break;
+      case "ice-candidate":
+        await handleIceCandidate(from, data.candidate);
+        break;
+    }
+  });
+}
+// ...existing code...
+
 
   async function handleIceCandidate(from, candidate) {
     const pc = pcsRef.current[from];
@@ -186,81 +246,7 @@ export default function App() {
     }
   }
 
-  async function joinRoom() {
-    await startLocalMedia();
 
-    socketRef.current.on("joined", async ({ peers: peerIds }) => {
-      setConnected(true);
-      console.log("Peers na sala:", peerIds);
-
-      // Inicializar estado para cada peer existente
-      const initialPeers = {};
-      peerIds.forEach(peerId => {
-        initialPeers[peerId] = { connected: false, hasVideo: false, hasAudio: false };
-      });
-      setPeers(initialPeers);
-
-      // Conectar com cada peer existente
-      for (const peerId of peerIds) {
-        if (!pcsRef.current[peerId]) {
-          const pc = createPeerConnection(peerId);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-
-          socketRef.current.emit("signal", {
-            to: peerId,
-            data: offer
-          });
-        }
-      }
-    });
-
-    socketRef.current.on("peer-joined", async ({ socketId }) => {
-      console.log("Novo peer entrou:", socketId);
-
-      // Adicionar novo peer ao estado
-      setPeers(prev => ({
-        ...prev,
-        [socketId]: { connected: false, hasVideo: false, hasAudio: false }
-      }));
-
-      // Iniciar conexão com o novo peer
-      if (!pcsRef.current[socketId]) {
-        const pc = createPeerConnection(socketId);
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        socketRef.current.emit("signal", {
-          to: socketId,
-          data: offer
-        });
-      }
-    });
-
-    socketRef.current.on("signal", async ({ from, data }) => {
-      switch (data.type) {
-        case "offer":
-          await handleOffer(from, data);
-          break;
-        case "answer":
-          await handleAnswer(from, data);
-          break;
-        case "ice-candidate":
-          await handleIceCandidate(from, data.candidate);
-          break;
-      }
-    });
-
-    socketRef.current.on("peer-left", ({ socketId }) => {
-      cleanupPeer(socketId);
-    });
-
-    socketRef.current.on("room-created", ({ roomId: newRoomId }) => {
-      setRoomId(newRoomId);
-    });
-
-    socketRef.current.emit("join", { roomId });
-  }
 
   function cleanupPeer(socketId) {
     if (pcsRef.current[socketId]) {
