@@ -16,19 +16,17 @@ export default function App() {
   const [peers, setPeers] = useState({});
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const socketRef = useRef(null);
-  const pcsRef = useRef({}); // Múltiplas conexões peer
+  const pcsRef = useRef({});
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const localVideoRef = useRef(null);
-  const remoteVideosRef = useRef({});
+  const remoteVideosContainerRef = useRef(null);
 
   const [muted, setMuted] = useState(false);
   const [camOff, setCamOff] = useState(false);
 
   useEffect(() => {
     socketRef.current = io(SIGNAL_SERVER_URL, { transports: ["websocket"] });
-
-    // Criar sala automaticamente ao carregar
     createNewRoom();
 
     return () => {
@@ -36,6 +34,32 @@ export default function App() {
       cleanupAll();
     };
   }, []);
+
+  // Função para criar elemento de vídeo remoto
+  const createRemoteVideoElement = (socketId) => {
+    const videoElement = document.createElement('video');
+    videoElement.id = `remote-video-${socketId}`;
+    videoElement.playsInline = true;
+    videoElement.autoplay = true;
+    videoElement.style.cssText = `
+      width: 100%;
+      height: 240px;
+      background: #000;
+      border-radius: 8px;
+      border: 2px solid #ddd;
+      margin-bottom: 16px;
+    `;
+
+    return videoElement;
+  };
+
+  // Função para remover elemento de vídeo remoto
+  const removeRemoteVideoElement = (socketId) => {
+    const videoElement = document.getElementById(`remote-video-${socketId}`);
+    if (videoElement) {
+      videoElement.remove();
+    }
+  };
 
   function createNewRoom() {
     const newRoomId = uuidv4();
@@ -75,30 +99,26 @@ export default function App() {
     // Receber tracks remotas
     pc.ontrack = (event) => {
       const [remoteStream] = event.streams;
-      if (!remoteVideosRef.current[remoteSocketId]) {
-        // Criar novo elemento de vídeo para este peer
-        const videoElement = document.createElement('video');
-        videoElement.playsInline = true;
-        videoElement.autoplay = true;
-        videoElement.style.cssText = `
-          width: 100%;
-          height: 240px;
-          background: #000;
-          border-radius: 8px;
-          border: 2px solid #ddd;
-          margin-bottom: 16px;
-        `;
 
-        const container = document.getElementById('remote-videos-container');
-        if (container) {
-          container.appendChild(videoElement);
-          remoteVideosRef.current[remoteSocketId] = videoElement;
+      // Criar elemento de vídeo para este peer
+      const videoElement = createRemoteVideoElement(remoteSocketId);
+      videoElement.srcObject = remoteStream;
+
+      // Adicionar ao container
+      if (remoteVideosContainerRef.current) {
+        remoteVideosContainerRef.current.appendChild(videoElement);
+      }
+
+      // Atualizar estado do peer para conectado
+      setPeers(prev => ({
+        ...prev,
+        [remoteSocketId]: {
+          ...prev[remoteSocketId],
+          connected: true,
+          hasVideo: remoteStream.getVideoTracks().length > 0,
+          hasAudio: remoteStream.getAudioTracks().length > 0
         }
-      }
-
-      if (remoteVideosRef.current[remoteSocketId]) {
-        remoteVideosRef.current[remoteSocketId].srcObject = remoteStream;
-      }
+      }));
     };
 
     // Enviar candidatos ICE
@@ -113,11 +133,18 @@ export default function App() {
 
     pc.onconnectionstatechange = () => {
       console.log(`PC ${remoteSocketId} state:`, pc.connectionState);
+
       if (pc.connectionState === 'connected') {
         setPeers(prev => ({
           ...prev,
-          [remoteSocketId]: { connected: true }
+          [remoteSocketId]: {
+            ...prev[remoteSocketId],
+            connected: true
+          }
         }));
+      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        // Remover peer se desconectado
+        cleanupPeer(remoteSocketId);
       }
     };
 
@@ -166,6 +193,13 @@ export default function App() {
       setConnected(true);
       console.log("Peers na sala:", peerIds);
 
+      // Inicializar estado para cada peer existente
+      const initialPeers = {};
+      peerIds.forEach(peerId => {
+        initialPeers[peerId] = { connected: false, hasVideo: false, hasAudio: false };
+      });
+      setPeers(initialPeers);
+
       // Conectar com cada peer existente
       for (const peerId of peerIds) {
         if (!pcsRef.current[peerId]) {
@@ -183,6 +217,12 @@ export default function App() {
 
     socketRef.current.on("peer-joined", async ({ socketId }) => {
       console.log("Novo peer entrou:", socketId);
+
+      // Adicionar novo peer ao estado
+      setPeers(prev => ({
+        ...prev,
+        [socketId]: { connected: false, hasVideo: false, hasAudio: false }
+      }));
 
       // Iniciar conexão com o novo peer
       if (!pcsRef.current[socketId]) {
@@ -228,11 +268,10 @@ export default function App() {
       delete pcsRef.current[socketId];
     }
 
-    if (remoteVideosRef.current[socketId]) {
-      remoteVideosRef.current[socketId].remove();
-      delete remoteVideosRef.current[socketId];
-    }
+    // Remover elemento de vídeo
+    removeRemoteVideoElement(socketId);
 
+    // Remover do estado
     setPeers(prev => {
       const newPeers = { ...prev };
       delete newPeers[socketId];
@@ -252,7 +291,13 @@ export default function App() {
       screenStreamRef.current.getTracks().forEach(track => track.stop());
       screenStreamRef.current = null;
     }
+
+    // Limpar todos os elementos de vídeo remotos
+    if (remoteVideosContainerRef.current) {
+      remoteVideosContainerRef.current.innerHTML = '';
+    }
   }
+
 
   function leaveRoom() {
     socketRef.current.emit("leave");
@@ -348,6 +393,7 @@ export default function App() {
   }
 
   const participantCount = Object.keys(peers).length;
+  const connectedParticipants = Object.values(peers).filter(p => p.connected).length;
 
   return (
     <div style={{ maxWidth: 1200, margin: "2rem auto", fontFamily: "sans-serif" }}>
@@ -419,8 +465,7 @@ export default function App() {
           Copiar
         </button>
       </div>
-
-      <div style={{
+<div style={{
         display: "grid",
         gridTemplateColumns: "1fr 1fr",
         gap: 16,
@@ -444,9 +489,14 @@ export default function App() {
         </div>
 
         <div>
-          <h3>Participantes Remotos ({participantCount})</h3>
-          <div id="remote-videos-container">
-            {/* Vídeos remotos serão adicionados dinamicamente aqui */}
+          <h3>Participantes Remotos ({connectedParticipants} conectados)</h3>
+          <div
+            ref={remoteVideosContainerRef}
+            style={{
+              display: "grid",
+              gap: "16px"
+            }}
+          >
             {participantCount === 0 && (
               <div style={{
                 width: "100%",
@@ -478,6 +528,34 @@ export default function App() {
         <p>🎥 {camOff ? "Câmera desligada" : "Câmera ativa"}</p>
         <p>🔊 {muted ? "Microfone mudo" : "Microfone ativo"}</p>
         <p>🖥️ {isScreenSharing ? "Compartilhando tela" : "Tela não compartilhada"}</p>
+
+        {/* Lista detalhada de participantes */}
+        {participantCount > 0 && (
+          <div style={{ marginTop: '16px' }}>
+            <h5>Detalhes dos Participantes:</h5>
+            {Object.entries(peers).map(([socketId, peerInfo]) => (
+              <div key={socketId} style={{
+                padding: '8px',
+                margin: '4px 0',
+                background: peerInfo.connected ? '#e8f5e8' : '#fff3cd',
+                borderRadius: '4px',
+                border: '1px solid #ddd'
+              }}>
+                <strong>ID: {socketId.substring(0, 8)}...</strong>
+                <br />
+                Status: {peerInfo.connected ? '✅ Conectado' : '⏳ Conectando...'}
+                <br />
+                {peerInfo.connected && (
+                  <>
+                    Vídeo: {peerInfo.hasVideo ? '🎥 Ativo' : '❌ Inativo'}
+                    <br />
+                    Áudio: {peerInfo.hasAudio ? '🔊 Ativo' : '❌ Inativo'}
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
