@@ -45,7 +45,7 @@ export default function App() {
   function createNewRoom() {
     const newRoomId = uuidv4();
     setRoomId(newRoomId);
-    socketRef.current.emit("create-room");
+    socketRef.current.emit("create-room", { roomId: newRoomId });
   }
 
   async function startLocalMedia() {
