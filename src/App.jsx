@@ -536,7 +536,7 @@ export default function App() {
               <div key={socketId} style={{
                 padding: '8px',
                 margin: '4px 0',
-                background: peerInfo.connected ? '#e8f5e8' : '#fff3cd',
+                background: peerInfo.connected ? '#005e002f' : '#433c2721',
                 borderRadius: '4px',
                 border: '1px solid #ddd'
               }}>
