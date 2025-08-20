@@ -455,7 +455,7 @@ export default function App() {
         </button>
       </div>
 
-      <div style={{ marginBottom: '16px', padding: '12px', background: '#f5f5f5', borderRadius: '8px' }}>
+      <div style={{ marginBottom: '16px', padding: '12px',borderRadius: '8px' }}>
         <strong>Compartilhe este ID para outros participarem: </strong>
         <code>{roomId}</code>
         <button
@@ -520,7 +520,6 @@ export default function App() {
         padding: 16,
         borderRadius: "8px",
         border: "1px solid #ddd",
-        background: '#f9f9f9'
       }}>
         <h4>Status da Sala:</h4>
         <p>✅ {connected ? `Conectado na sala: ${roomId}` : "Desconectado"}</p>
